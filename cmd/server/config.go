@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"workbuddy2api/internal/upstream"
 )
 
 // Config 顶层配置。
@@ -51,6 +53,13 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+		// 双 realm 上游 base；空值回落 upstream.Default*（CN 与国际站默认 host）。
+		// 账号归属按凭证 domain 自动判定（workbuddy.ai/codebuddy.ai → global），
+		// 此处仅在默认 host 变更或自建镜像时覆盖。
+		ChatBaseCN        string `json:"chat_base_cn"`
+		BillingBaseCN     string `json:"billing_base_cn"`
+		ChatBaseGlobal    string `json:"chat_base_global"`
+		BillingBaseGlobal string `json:"billing_base_global"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -173,6 +182,18 @@ func applyEnv(c *Config) {
 			c.Upstream.IdleTimeoutSeconds = n
 		}
 	}
+	if v := os.Getenv("WB2A_CHAT_BASE_CN"); v != "" {
+		c.Upstream.ChatBaseCN = v
+	}
+	if v := os.Getenv("WB2A_BILLING_BASE_CN"); v != "" {
+		c.Upstream.BillingBaseCN = v
+	}
+	if v := os.Getenv("WB2A_CHAT_BASE_GLOBAL"); v != "" {
+		c.Upstream.ChatBaseGlobal = v
+	}
+	if v := os.Getenv("WB2A_BILLING_BASE_GLOBAL"); v != "" {
+		c.Upstream.BillingBaseGlobal = v
+	}
 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
@@ -223,6 +244,18 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	if c.Upstream.ChatBaseCN == "" {
+		c.Upstream.ChatBaseCN = upstream.DefaultChatBaseCN
+	}
+	if c.Upstream.BillingBaseCN == "" {
+		c.Upstream.BillingBaseCN = upstream.DefaultBillingBaseCN
+	}
+	if c.Upstream.ChatBaseGlobal == "" {
+		c.Upstream.ChatBaseGlobal = upstream.DefaultChatBaseGlobal
+	}
+	if c.Upstream.BillingBaseGlobal == "" {
+		c.Upstream.BillingBaseGlobal = upstream.DefaultBillingBaseGlobal
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

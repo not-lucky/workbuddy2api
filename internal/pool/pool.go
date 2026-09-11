@@ -473,6 +473,39 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	return p.pick(tried)
 }
 
+// PickHealthyByRegion 返回指定 realm 第一个 healthy 账号（按 UID 排序，确定性）。
+// 无可用返回 nil。供模型列表等按 realm 拉取场景；不记录 lastUsed，不干扰选号分布。
+func (p *Pool) PickHealthyByRegion(region auth.Region) *auth.Auth {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	uids := make([]string, 0, len(p.byUID))
+	for uid := range p.byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	for _, uid := range uids {
+		e := p.byUID[uid]
+		if e.a.Region() != region || !e.healthy(now) {
+			continue
+		}
+		return e.a
+	}
+	return nil
+}
+
+// HasRegionAccounts 报告该 realm 是否有任一非禁用账号（健康与否不论）。
+func (p *Pool) HasRegionAccounts(region auth.Region) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, e := range p.byUID {
+		if e.a.Region() == region && !e.disabled {
+			return true
+		}
+	}
+	return false
+}
+
 // pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // 候选集是 top5 近似：先按三因子权重（weightOf）降序取前 5（credits 只是权重的一个因子，
 // 闲置补偿与成功率同样决定谁进短名单），再在 top5 内做防撞号过滤。

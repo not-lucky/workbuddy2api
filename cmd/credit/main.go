@@ -10,8 +10,8 @@
 //	 "total":{"remain":N,"used":N,"size":N,"accounts":N,"ok":N,"failed":N},
 //	 "accounts":[{"uid","nickname","remain","used","size","packages","ok","error?"}]}
 //
-// 接口与聚合逻辑：POST codebuddy.cn/v2/billing/meter/get-user-resource，聚合所有 package 的
-// Cycle* 字段，TotalDosage 作 size 下限。
+// 接口与聚合逻辑：POST <realm-host>/v2/billing/meter/get-user-resource（host 按账号
+// domain 分流 CN/global），聚合所有 package 的 Cycle* 字段，TotalDosage 作 size 下限。
 package main
 
 import (
@@ -23,9 +23,18 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
-const billingBaseCN = "https://www.codebuddy.cn"
+// billingBaseFor 按账号 domain 选择 billing host（CN/global 同 upstream.Client 分流规则）。
+func billingBaseFor(domain string) string {
+	if auth.IsGlobalDomain(domain) {
+		return upstream.DefaultBillingBaseGlobal
+	}
+	return upstream.DefaultBillingBaseCN
+}
 
 type authFile struct {
 	Auth struct {
@@ -98,7 +107,7 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	})
-	req, err := http.NewRequest(http.MethodPost, billingBaseCN+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, billingBaseFor(af.Auth.Domain)+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}

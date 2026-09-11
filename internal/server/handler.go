@@ -139,12 +139,49 @@ var staticModels = []map[string]any{
 	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 }
 
-// dynamicModelsCache 动态模型缓存。
-var dynamicModelsCache struct {
-	sync.RWMutex
+// 静态 Global 模型表（动态拉取失败时的回退；动态成功时永远优先）。
+// 以线上实测可用模型为准；kimi-k2.7 / deepseek-v4-flash 在国际站上游 503，未收录。
+// context_length 为公开资料近似值，仅回退展示用。
+var staticModelsGlobal = []map[string]any{
+	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "hy3-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "hy3-preview-agent", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "gpt-5.6-sol", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.6-terra", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.6-luna", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.5", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.4", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gpt-5.3-codex", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 400000},
+	{"id": "gemini-3.5-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000},
+	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "kimi-k3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000},
+	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+}
+
+// staticModelsFor 返回指定 realm 的静态回退表。
+func staticModelsFor(region auth.Region) []map[string]any {
+	if region == auth.RegionGlobal {
+		return staticModelsGlobal
+	}
+	return staticModels
+}
+
+// realmModelsCache 单 realm 的动态模型缓存。
+type realmModelsCache struct {
 	ids      []upstream.ModelInfo
 	fetched  time.Time // 最近一次成功拉取时间
 	lastFail time.Time // 最近一次拉取失败时间（负缓存）
+}
+
+// dynamicModelsCache 动态模型缓存（按 realm 独立：CN 与国际站模型目录不同）。
+var dynamicModelsCache struct {
+	sync.RWMutex
+	byRealm map[auth.Region]*realmModelsCache
 }
 
 const (
@@ -152,7 +189,7 @@ const (
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-// models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
+// models 返回模型列表：各 realm 优先动态（缓存 1h），失败回退各自静态表，取并集。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
@@ -160,62 +197,91 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
+// modelList 按 realm 分别动态获取并包装成 OpenAI 格式（含 context_length），取并集去重。
+// realm 在池中无账号时不参与列表；动态失败时回退该 realm 静态表。
 func (h *Handler) modelList() []map[string]any {
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos))
-		for _, mi := range infos {
-			entry := map[string]any{
-				"id":                mi.ID,
-				"object":            "model",
-				"created":           1753600000,
-				"owned_by":          "workbuddy",
-				"context_length":    mi.ContextWindow,
-				"max_output_tokens": mi.MaxTokens,
-			}
-			if mi.ContextWindow == 0 {
-				entry["context_length"] = 131072 // 兜底
-			}
-			out = append(out, entry)
+	seen := make(map[string]bool)
+	var out []map[string]any
+	add := func(id string, entry map[string]any) {
+		if id == "" || seen[id] {
+			return
 		}
-		return out
+		seen[id] = true
+		out = append(out, entry)
 	}
-	return staticModels
+	for _, region := range []auth.Region{auth.RegionCN, auth.RegionGlobal} {
+		if !h.cfg.Pool.HasRegionAccounts(region) {
+			continue
+		}
+		if infos := h.fetchDynamicModelsForRegion(region); len(infos) > 0 {
+			for _, mi := range infos {
+				ctx := mi.ContextWindow
+				if ctx == 0 {
+					ctx = 131072 // 兜底
+				}
+				add(mi.ID, map[string]any{
+					"id":                mi.ID,
+					"object":            "model",
+					"created":           1753600000,
+					"owned_by":          "workbuddy",
+					"context_length":    ctx,
+					"max_output_tokens": mi.MaxTokens,
+				})
+			}
+			continue
+		}
+		for _, m := range staticModelsFor(region) {
+			id, _ := m["id"].(string)
+			add(id, m)
+		}
+	}
+	return out
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
-// 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
-func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
+// fetchDynamicModelsForRegion 取指定 realm 的动态模型列表（含 contextWindow/maxTokens）。
+// 各 realm 独立 1h 缓存 + 5min 负缓存（冷却期内不再请求上游）；realm 无健康账号时返回 nil。
+// 拉取失败惩罚该账号（避免下次又选中同一个反复失败），并记录负缓存时间戳。
+func (h *Handler) fetchDynamicModelsForRegion(region auth.Region) []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
-		return out
-	}
-	// 失败负缓存：冷却期内不再请求上游。
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
-		return nil
+	c := dynamicModelsCache.byRealm[region]
+	var ids []upstream.ModelInfo
+	var fetched, lastFail time.Time
+	if c != nil {
+		ids, fetched, lastFail = c.ids, c.fetched, c.lastFail
 	}
 	dynamicModelsCache.RUnlock()
+	if len(ids) > 0 && time.Since(fetched) < dynamicModelsTTL {
+		return ids
+	}
+	// 失败负缓存：冷却期内不再请求上游。
+	if !lastFail.IsZero() && time.Since(lastFail) < modelsFetchFailCooldown {
+		return nil
+	}
 
-	acct := h.cfg.Pool.Pick()
+	acct := h.cfg.Pool.PickHealthyByRegion(region)
 	if acct == nil {
 		return nil
 	}
 	infos, err := h.cfg.Upstream.FetchModels(acct)
+	dynamicModelsCache.Lock()
+	if dynamicModelsCache.byRealm == nil {
+		dynamicModelsCache.byRealm = make(map[auth.Region]*realmModelsCache)
+	}
+	cc := dynamicModelsCache.byRealm[region]
+	if cc == nil {
+		cc = &realmModelsCache{}
+		dynamicModelsCache.byRealm[region] = cc
+	}
 	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
+		// 拉取失败惩罚该账号，避免下次又选中同一个反复失败；lastFail 保持负缓存。
 		h.cfg.Pool.NoteError(acct.UID)
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
+		cc.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
 		return nil
 	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
+	cc.ids = infos
+	cc.fetched = time.Now()
+	cc.lastFail = time.Time{} // 成功则清空负缓存
 	dynamicModelsCache.Unlock()
 	return infos
 }

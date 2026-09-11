@@ -11,9 +11,14 @@ import (
 const (
 	clientUA        = "CLI/2.63.2 CodeBuddy/2.63.2"
 	originRefererCN = "https://www.codebuddy.cn"
+	// Global Origin/Referer 与 BillingBaseGlobal 同 host（PR #23 实测可用）。
+	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
 func originRefererFor(a *auth.Auth) string {
+	if a.Region() == auth.RegionGlobal {
+		return originRefererGlobal
+	}
 	return originRefererCN
 }
 

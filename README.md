@@ -16,11 +16,15 @@
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
 </p>
 
+<p align="center">
+  <b>中文</b> · <a href="./README.en.md">English</a>
+</p>
+
 ---
 
 ## 📖 项目简介
 
-WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾讯 CodeBuddy（`copilot.tencent.com`）账号包装为统一的 `/v1/chat/completions` 服务。
+WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾讯 CodeBuddy（国内站 `copilot.tencent.com` / 国际站 `www.workbuddy.ai`）账号包装为统一的 `/v1/chat/completions` 服务。
 
 - 官方不提供 OpenAI 形态的开放 API，本项目通过 **OAuth 设备授权** 获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理；
 - 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却/熔断防止雪崩、会话粘性保证多轮上下文不跳号；
@@ -89,13 +93,14 @@ cp config.example.json config.json
 ### 2. 登录添加账号
 
 ```bash
-./login.sh
-# 1) 脚本输出授权 URL
+./login.sh [cn|global]
+# 缺省 cn；global 账号用 ./login.sh global
+# 1) 脚本输出对应 realm 的授权 URL
 # 2) 浏览器打开完成登录
 # 3) 回到终端按 y → 自动签到 → 落盘 auths/workbuddy-<uid>.json → 重启容器
 ```
 
-多账号只需重复执行；账号池自动发现 `auths/` 下新增凭证文件（容器启动时 `SyncToDir` 对齐）。
+多账号只需重复执行（CN 与 Global 可混用，网关按凭证 `domain` 自动分流）；账号池自动发现 `auths/` 下新增凭证文件（容器启动时 `SyncToDir` 对齐）。
 
 ### 3. 启动服务
 
@@ -151,7 +156,11 @@ curl -s http://localhost:7863/v1/chat/completions \
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
-    "idle_timeout_seconds": 300
+    "idle_timeout_seconds": 300,
+    "chat_base_cn": "https://copilot.tencent.com",
+    "billing_base_cn": "https://www.codebuddy.cn",
+    "chat_base_global": "https://www.workbuddy.ai",
+    "billing_base_global": "https://www.workbuddy.ai"
   },
   "features": { "sanitize_blacklist_fingerprints": true },
   "upstash": { "url": "", "token": "" },
@@ -184,6 +193,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新/签到/余额/模型）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
+| `upstream.chat_base_cn` / `billing_base_cn` | `copilot.tencent.com` / `www.codebuddy.cn` | CN realm 上游 host（一般无需改动） |
+| `upstream.chat_base_global` / `billing_base_global` | `www.workbuddy.ai` | Global realm 上游 host（一般无需改动） |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
 | `upstash.url` / `token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
@@ -210,7 +221,11 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`（duration） · `WB2A_SOFT_RATE_MAX`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool）
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`（duration） · `WB2A_SOFT_RATE_MAX`（duration） · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_SANITIZE_FINGERPRINTS`（bool） · `WB2A_CHAT_BASE_CN` · `WB2A_BILLING_BASE_CN` · `WB2A_CHAT_BASE_GLOBAL` · `WB2A_BILLING_BASE_GLOBAL`
+
+### 双 realm（CN / Global）
+
+网关按账号凭证 `domain` 自动分流，可混合组池：`workbuddy.ai` / `codebuddy.ai` 后缀 → Global（`www.workbuddy.ai`），其余（含空）→ CN。聊天、刷新、模型、余额、签到、猫猫旅行全部走同一分流规则；`Origin`/`Referer` 与 `X-Domain` 随 realm 切换。默认 host 上线可用，一般无需配置 `upstream.*_base_*`。
 
 ## 🧠 账号池与流量治理
 
@@ -459,6 +474,8 @@ curl -s http://127.0.0.1:7863/healthz | grep -q '"service":"workbuddy2api"'
 | `/activity/growth/buddy/travel/status` `depart` `claim` | GET/POST | 同上 | 猫猫旅行：状态 / 派出 / 领奖（随签到时点执行） |
 
 > 上述 `/v2/*` 端点是 CodeBuddy 官方 CLI/插件使用的接口，**未见公开 API 文档，属非公开/逆向接口**；本项目不主张任何上游接口的官方授权或稳定性承诺。出站统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**。
+>
+> 双 realm host：CN 为 `copilot.tencent.com`（chat/auth/models/旅行）+ `www.codebuddy.cn`（billing）；Global（国际站）两者均为 `www.workbuddy.ai`，路径与上表相同。
 
 ### 4. 发布来源与合规边界
 
@@ -479,7 +496,7 @@ curl -s http://127.0.0.1:7863/healthz | grep -q '"service":"workbuddy2api"'
 
 | 脚本 | 用途 |
 |---|---|
-| `./login.sh` | OAuth 登录 → 落盘 auth → 重启容器 |
+| `./login.sh [cn\|global]` | OAuth 登录 → 落盘 auth → 重启容器（缺省 `cn`） |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
 

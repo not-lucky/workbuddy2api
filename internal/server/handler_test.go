@@ -610,11 +610,7 @@ func TestModelsEndpoint(t *testing.T) {
 
 func TestModelsDynamic(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游返回动态模型（含 agents + maxInputTokens/maxOutputTokens）
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -664,7 +660,7 @@ func TestModelsDynamic(t *testing.T) {
 
 	// 第二次调用走缓存（把上游关掉也成功）
 	dynamicModelsCache.RLock()
-	cached := len(dynamicModelsCache.ids)
+	cached := len(dynamicModelsCache.byRealm[auth.RegionCN].ids)
 	dynamicModelsCache.RUnlock()
 	if cached != 3 {
 		t.Errorf("cache not populated: %d", cached)
@@ -673,11 +669,7 @@ func TestModelsDynamic(t *testing.T) {
 
 func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游 500
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -701,11 +693,7 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 
 func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
@@ -726,11 +714,7 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 
 func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -755,7 +739,7 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
 	dynamicModelsCache.Lock()
-	dynamicModelsCache.lastFail = time.Now().Add(-10 * time.Minute)
+	dynamicModelsCache.byRealm[auth.RegionCN].lastFail = time.Now().Add(-10 * time.Minute)
 	dynamicModelsCache.Unlock()
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))

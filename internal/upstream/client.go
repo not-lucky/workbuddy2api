@@ -147,6 +147,17 @@ type apiEnvelope struct {
 	Data json.RawMessage `json:"data"`
 }
 
+// 默认上游 base（双 realm 单一来源；Client 字段与 config 覆盖均回落至此）。
+const (
+	DefaultChatBaseCN        = "https://copilot.tencent.com"
+	DefaultBillingBaseCN     = "https://www.codebuddy.cn"
+	DefaultChatBaseGlobal    = "https://www.workbuddy.ai"
+	DefaultBillingBaseGlobal = "https://www.workbuddy.ai"
+	// DefaultGlobalDomain 上游偶发省略 domain 时 global 账号的回填值
+	//（PR #23 实测 token 返回 www.workbuddy.ai）。
+	DefaultGlobalDomain = "www.workbuddy.ai"
+)
+
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
 	HTTP *http.Client
@@ -170,6 +181,11 @@ type Client struct {
 
 	ChatBaseCN    string
 	BillingBaseCN string
+
+	// Global（国际站）base；chatBase/billingBase 按账号 domain 分流，
+	// 空 domain 缺省 CN（老凭证行为不变）。
+	ChatBaseGlobal    string
+	BillingBaseGlobal string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -185,8 +201,10 @@ func New() *Client {
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		SanitizeFingerprints: true,
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
+		ChatBaseCN:           DefaultChatBaseCN,
+		BillingBaseCN:        DefaultBillingBaseCN,
+		ChatBaseGlobal:       DefaultChatBaseGlobal,
+		BillingBaseGlobal:    DefaultBillingBaseGlobal,
 	}
 }
 
@@ -199,6 +217,9 @@ func (c *Client) chatHTTP() *http.Client {
 }
 
 func (c *Client) chatBase(a *auth.Auth) string {
+	if a.Region() == auth.RegionGlobal {
+		return c.ChatBaseGlobal
+	}
 	return c.ChatBaseCN
 }
 
@@ -222,6 +243,9 @@ func (c *Client) effortsSnapshot() map[string][]string {
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
+	if a.Region() == auth.RegionGlobal {
+		return c.BillingBaseGlobal
+	}
 	return c.BillingBaseCN
 }
 
@@ -391,7 +415,14 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 	}
 	if len(cliIDs) == 0 {
-		return nil, fmt.Errorf("no cli agent models found")
+		// 部分 realm 的 agents 数组不含 cli 入口：回落为全部未禁用模型，
+		// 而非直接报错（否则调用方只能看到另一 realm 的静态表）。
+		for _, m := range env.Data.Models {
+			if !m.Disabled {
+				cliIDs = append(cliIDs, m.ID)
+			}
+		}
+		log.Printf("models api: no cli agent entry, using all %d non-disabled models", len(cliIDs))
 	}
 	dynMap := make(map[string]struct {
 		ID              string

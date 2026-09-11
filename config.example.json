@@ -16,7 +16,11 @@
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
-    "idle_timeout_seconds": 300
+    "idle_timeout_seconds": 300,
+    "chat_base_cn": "https://copilot.tencent.com",
+    "billing_base_cn": "https://www.codebuddy.cn",
+    "chat_base_global": "https://www.workbuddy.ai",
+    "billing_base_global": "https://www.workbuddy.ai"
   },
   "features": {
     "sanitize_blacklist_fingerprints": true

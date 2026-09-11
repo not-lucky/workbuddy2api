@@ -70,9 +70,11 @@ func jsonResp(status int, body string) *http.Response {
 
 func testClient(fn rtFunc) *Client {
 	return &Client{
-		HTTP:          &http.Client{Transport: fn},
-		ChatBaseCN:    "https://chat.example",
-		BillingBaseCN: "https://billing.example",
+		HTTP:              &http.Client{Transport: fn},
+		ChatBaseCN:        "https://chat.example",
+		BillingBaseCN:     "https://billing.example",
+		ChatBaseGlobal:    "https://chat-global.example",
+		BillingBaseGlobal: "https://billing-global.example",
 	}
 }
 
@@ -327,16 +329,26 @@ func TestDailyCheckinAlready(t *testing.T) {
 	}
 }
 
-func TestBasesAlwaysCN(t *testing.T) {
+func TestBasesDispatchByRegion(t *testing.T) {
 	c := testClient(nil)
 	cn := &auth.Auth{Domain: ""}
-	other := &auth.Auth{Domain: "example.com"}
+	global := &auth.Auth{Domain: "www.workbuddy.ai"}
+	alias := &auth.Auth{Domain: "www.codebuddy.ai"}
 	if c.chatBase(cn) != "https://chat.example" || c.billingBase(cn) != "https://billing.example" {
 		t.Error("cn bases wrong")
 	}
-	// 恒 CN：domain 不同不改变上游 host。
-	if c.chatBase(other) != c.chatBase(cn) || c.billingBase(other) != c.billingBase(cn) {
-		t.Error("bases must be CN regardless of domain")
+	// Global 账号按 domain 分流到 Global host；空 domain 缺省 CN。
+	if c.chatBase(global) != "https://chat-global.example" || c.billingBase(global) != "https://billing-global.example" {
+		t.Error("global bases wrong")
+	}
+	if c.chatBase(alias) != "https://chat-global.example" || c.billingBase(alias) != "https://billing-global.example" {
+		t.Error("codebuddy.ai alias must route to global")
+	}
+	if originRefererFor(cn) != "https://www.codebuddy.cn" {
+		t.Errorf("cn origin=%q", originRefererFor(cn))
+	}
+	if originRefererFor(global) != "https://www.workbuddy.ai" {
+		t.Errorf("global origin=%q", originRefererFor(global))
 	}
 }
 

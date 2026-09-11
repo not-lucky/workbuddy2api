@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# login.sh — WorkBuddy CN OAuth 登录 → 落盘 auth 文件
+# login.sh — WorkBuddy OAuth 登录 → 落盘 auth 文件
 #
 # 用法:
-#   ./login.sh
+#   ./login.sh [cn|global]   # 缺省 cn（老用户行为不变）
 #
 # 流程:
 #   1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
@@ -15,6 +15,18 @@ cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
 
+REGION="${1:-cn}"
+if [[ "$REGION" != "cn" && "$REGION" != "global" ]]; then
+    echo "用法: ./login.sh [cn|global]"
+    exit 1
+fi
+
+# 签到 host 随 region 切换（与 cmd/login 的 OAuth base 同 realm）。
+CHECKIN_BASE="https://www.codebuddy.cn"
+if [[ "$REGION" == "global" ]]; then
+    CHECKIN_BASE="https://www.workbuddy.ai"
+fi
+
 mkdir -p "$AUTH_DIR"
 
 # login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
@@ -24,11 +36,11 @@ if [[ ! -x "$LOGIN_BIN" ]]; then
 fi
 
 echo "============================================================"
-echo "  WorkBuddy OAuth 登录"
+echo "  WorkBuddy ${REGION} OAuth 登录"
 echo "============================================================"
 echo ""
 
-AUTH_URL=$("$LOGIN_BIN" url)
+AUTH_URL=$("$LOGIN_BIN" url "$REGION")
 
 echo "请在浏览器中打开以下链接完成登录："
 echo ""
@@ -51,7 +63,7 @@ fi
 echo ""
 echo "正在获取 token..."
 
-RESULT=$("$LOGIN_BIN" poll) || {
+RESULT=$("$LOGIN_BIN" poll "$REGION") || {
     echo ""
     echo "获取 token 失败。可能原因："
     echo "  - 登录还没完成就按了 y（重新运行 ./login.sh 再试）"
@@ -74,12 +86,12 @@ fi
 
 EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
-# ─── 签到（CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞）───
+# ─── 签到（POST <realm-host>/v2/billing/meter/daily-checkin，幂等不阻塞）───
 python3 - <<PYEOF
 import json, urllib.request, urllib.error
 
 req = urllib.request.Request(
-    "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
+    "$CHECKIN_BASE/v2/billing/meter/daily-checkin",
     method="POST", data=b"{}",
     headers={
         "Authorization": "Bearer $TOKEN",
