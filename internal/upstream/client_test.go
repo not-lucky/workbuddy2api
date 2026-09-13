@@ -138,9 +138,11 @@ func jsonResp(status int, body string) *http.Response {
 
 func testClient(fn rtFunc) *Client {
 	return &Client{
-		HTTP:          &http.Client{Transport: fn},
-		ChatBaseCN:    "https://chat.example",
-		BillingBaseCN: "https://billing.example",
+		HTTP:              &http.Client{Transport: fn},
+		ChatBaseCN:        "https://chat.example",
+		BillingBaseCN:     "https://billing.example",
+		ChatBaseGlobal:    "https://chat-global.example",
+		BillingBaseGlobal: "https://billing-global.example",
 	}
 }
 
@@ -510,7 +512,6 @@ func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 	}
 }
 
-
 func TestBasesDispatchByRegion(t *testing.T) {
 	c := testClient(nil)
 	cn := &auth.Auth{Domain: ""}
@@ -531,68 +532,5 @@ func TestBasesDispatchByRegion(t *testing.T) {
 	}
 	if originRefererFor(global) != "https://www.workbuddy.ai" {
 		t.Errorf("global origin=%q", originRefererFor(global))
-	}
-}
-
-func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
-	c := New()
-	if c.ChatHTTP == nil {
-		t.Fatal("ChatHTTP should be initialized")
-	}
-	if c.ChatHTTP.Timeout != 0 {
-		t.Errorf("ChatHTTP.Timeout=%v want 0 (no total cap)", c.ChatHTTP.Timeout)
-	}
-	// 共享同一个 Transport 实例，连接池不重复。
-	if c.ChatHTTP.Transport != c.HTTP.Transport {
-		t.Errorf("ChatHTTP and HTTP must share the same *http.Transport")
-	}
-	htr, ok := c.ChatHTTP.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
-	}
-	if htr.ResponseHeaderTimeout != 120*time.Second {
-		t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
-	}
-}
-
-func TestChatStreamRoutesToChatHTTP(t *testing.T) {
-	// 显式注入 ChatHTTP（可辨识标记），验证 ChatStream 走它而非 HTTP。
-	chatHit, httpHit := false, false
-	c := testClient(func(*http.Request) (*http.Response, error) {
-		httpHit = true
-		return jsonResp(200, `{}`), nil
-	})
-	c.ChatHTTP = &http.Client{Transport: rtFunc(func(*http.Request) (*http.Response, error) {
-		chatHit = true
-		return &http.Response{
-			StatusCode: 200,
-			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
-		}, nil
-	})}
-	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{}`))
-	if err != nil || status != 200 {
-		t.Fatalf("chat: status=%d err=%v", status, err)
-	}
-	rc.Close()
-	if !chatHit {
-		t.Error("ChatStream should use ChatHTTP")
-	}
-	if httpHit {
-		t.Error("ChatStream must not use HTTP")
-	}
-}
-
-func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
-	c := testClient(func(*http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: 200,
-			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
-		}, nil
-	})
-	if c.chatHTTP() != c.HTTP {
-		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
 	}
 }

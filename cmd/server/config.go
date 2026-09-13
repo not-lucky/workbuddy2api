@@ -233,6 +233,7 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_BILLING_BASE_GLOBAL"); v != "" {
 		c.Upstream.BillingBaseGlobal = v
+	}
 	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
 		c.Upstream.UserAgent = v
 	}
