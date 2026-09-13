@@ -4,15 +4,19 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -23,6 +27,9 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权
 	MaxRotate int    // 单请求最多换号次数，默认 3
+	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
+	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
+	MaxBodyBytes int64
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -31,6 +38,11 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+
+	// PromptMode "custom"（网关用自有提示词替换 system）/ "passthrough"（透传）。
+	PromptMode string
+	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
+	PromptText string
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -46,8 +58,9 @@ const ServiceName = "workbuddy2api"
 
 // Handler 主路由。
 type Handler struct {
-	cfg Config
-	mux *http.ServeMux
+	cfg     Config
+	mux     *http.ServeMux
+	degrade degradeGate
 }
 
 // NewHandler 构建 handler。
@@ -60,6 +73,12 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
+	}
+	if cfg.PromptMode == "" {
+		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -287,13 +306,32 @@ func (h *Handler) fetchDynamicModelsForRegion(region auth.Region) []upstream.Mod
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	// 请求体上限：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
+	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
+	// unmarshal 报 unexpected EOF，网关却罚号轮空）。
+	// 413 是网关侧的客户端问题，不打上游、不罚账号、不轮转。
+	limit := h.cfg.MaxBodyBytes
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
+	if int64(len(body)) > limit {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
+			fmt.Sprintf("请求体超过 %d MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试", limit>>20))
+		return
+	}
+	// 调试开关：设置 WB2A_DUMP_REQ 即把上游侧收到的原始请求体落盘，供离线二分定位指纹命中行。
+	// 仅在排查上游指纹拦截时开启；不设置时零开销、不落盘。
+	// 只落"大请求"（超过上限一半）：小探针（{"input":"hi"} 之类）会覆盖掉真正要看的对话请求。
+	if os.Getenv("WB2A_DUMP_REQ") != "" && len(body)*2 >= int(limit) {
+		if err := os.WriteFile("/app/data/last_request.json", body, 0o600); err != nil {
+			log.Printf("ERR: [server] dump req: %v", err)
+		}
+	}
 	var peek struct {
-		Stream bool `json:"stream"`
+		Stream bool   `json:"stream"`
+		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
 
@@ -305,12 +343,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
+	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
+	// 仍可用），必须重分配——否则会被钉在这个号上反复失败。
 	sessKey := ""
 	stickyUID := ""
 	if h.cfg.Session != nil {
 		sessKey = session.ExtractKey(body)
 		if sessKey != "" {
-			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
+			// 用 peek.Model（缺省为空串）而非 st.model（缺省为 "-"）：
+			// 模型名参与成本账本与选号过滤，"-" 会污染成不存在的模型键。
+			if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
 				stickyUID = uid
 			}
 		}
@@ -329,28 +371,48 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			heldUID = ""
 		}
 	}
-	// fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
-	fail := func(uid string) {
-		releaseHeld()
-		if stickyUID != "" && uid == stickyUID {
+	// unbindSticky 解绑当前会话粘性号（stickyUID 非空时）。供「粘性号不可用/被抢」与 fail 共用。
+	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
+	unbindSticky := func() {
+		if stickyUID != "" {
 			h.cfg.Session.Unbind(sessKey)
 			stickyUID = ""
 		}
 	}
+	// fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
+	fail := func(uid string) {
+		releaseHeld()
+		if stickyUID != "" && uid == stickyUID {
+			unbindSticky()
+		}
+	}
+
+	// 系统提示词改写（出站前、轮转前；每个请求一次）。
+	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
+	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
+	//   - passthrough 非降级期：透传客户端原始 system（不改写）。
+	degradedApplied := false
+	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
+		body = prompt.Rewrite(body, h.cfg.PromptText)
+	} else if h.cfg.PromptMode == "passthrough" && h.degrade.Active() {
+		body = prompt.Rewrite(body, prompt.Degraded)
+		degradedApplied = true
+	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
+		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUID(stickyUID)
+			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, peek.Model)
 			if acct == nil {
-				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
-				h.cfg.Session.Unbind(sessKey)
-				stickyUID = ""
+				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）→ 解绑，本次回落普通轮换。
+				unbindSticky()
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			// 模型感知选号：请求携带 model 时启用 6004 模型级冷却豁免
+			// （PickExcludingForModel 内部当 model 为空时即退化为 PickExcluding）。
+			acct = h.cfg.Pool.PickExcludingForModel(tried, peek.Model)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -364,8 +426,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
-				h.cfg.Session.Unbind(sessKey)
-				stickyUID = ""
+				unbindSticky()
 			}
 			continue // 最后一个名额被并发抢走 → 换号
 		}
@@ -386,11 +447,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("chat refresh uid=%s: save auth failed: %v", acct.UID, err)
+				log.Printf("ERR: [server] chat refresh uid=%s: save auth failed: %v", logfmt.UID8(acct.UID), err)
 			}
 		}
 
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
+		// 客户端 IP 透传（仅 PassthroughIP 开启）：按请求取首段作为参数传入 ChatStream，
+		// 不再读写共享字段——并发请求各自携带独立 IP，互不串扰（issue：ClientIP 竞态）。
+		var clientIP string
+		if h.cfg.Upstream.PassthroughIP {
+			clientIP = upstream.ExtractClientIP(r)
+		}
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
@@ -402,8 +469,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if status >= 400 {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
+			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
+			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
+			// 第二次仍被拦（用户内容本身触发审核）→ 走既有错误路径返回客户端。
+			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
+			if kind == upstream.ErrContentBlocked && h.cfg.PromptMode == "passthrough" && !degradedApplied {
+				h.degrade.Trigger()
+				body = prompt.Rewrite(body, prompt.Degraded)
+				degradedApplied = true
+				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
+				releaseHeld()
+				log.Printf("WARN: [server] content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+				continue
+			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-			h.applyErrorPolicy(acct.UID, kind)
+			h.applyErrorPolicy(acct.UID, kind, string(respBody), peek.Model)
 			fail(acct.UID)
 			continue
 		}
@@ -420,6 +500,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = upstream.Stream(w, stats)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
+			// 供下次选号把免费/便宜的号排在前面。
+			if credit, ok := stats.Credit(); ok {
+				h.cfg.Pool.NoteModelCost(acct.UID, peek.Model, credit, stats.TotalTokens())
+			}
 			rc.Close()
 			return
 		}
@@ -434,6 +519,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
+		if credit, total, ok := usageCreditTotal(resp); ok {
+			h.cfg.Pool.NoteModelCost(acct.UID, peek.Model, credit, total)
+		}
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
@@ -448,26 +537,42 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
 // 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
 //
-// 五条路径，各司其职：
+// 七条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → Cooldown(CoolSoft, soft_rate)：即时软冷却，连续触发指数退避（封顶 soft_rate_max）。
+//   - ErrSoftRate → 默认 Cooldown(CoolSoft, soft_rate) 连续触发指数退避（封顶 soft_rate_max）；
+//     若上游 body 为模型级 6004 且带重置时间 → CooldownSoftForModel（until=重置墙钟，
+//     封顶 soft_rate_max，记录触发模型供切模型豁免）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError），passthrough 模式走降级重试。
+//   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
+// body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
+// 携带的模型名（触发 6004 时记录以便后续切模型豁免）。
+//
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
+func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 软冷却基数来自 soft_rate（默认 600s）；同一账号连续触发时 pool 内部按
-		// softStreak 指数退避并封顶 soft_rate_max。
+		// 模型级 6004 且带「将在 … 重置」时间（issue #31）：冷却到上游明说的重置墙钟
+		// （封顶 soft_rate_max），记录触发模型 → 该账号对**其他模型**请求可豁免冷却。
+		// 解析失败（无时间文案 / 非 6004）→ 退回既有 600s 基数 + 指数退避现况。
+		if upstream.IsModelRateLimit(body) {
+			if resetAt, ok := upstream.ParseSoftRateReset(body); ok {
+				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
+				return
+			}
+		}
+		// 其余 soft_rate：软冷却基数来自 soft_rate（默认 600s）；同一账号连续触发时
+		// pool 内部按 softStreak 指数退避并封顶 soft_rate_max。
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
@@ -478,6 +583,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
+	case upstream.ErrContentBlocked:
+		// 内容策略拦截（误报）：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
+		// passthrough 模式由 chatCompletions 内降级重试处理；custom 模式本不会到此分支。
+	case upstream.ErrBadParams:
+		// 请求体解析失败（400 + Unmarshal chat params failed / 11101）：发给上游的 body
+		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
+		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
+		// ——不同账号可能有不同的模型权限，值得换号再试一次。
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

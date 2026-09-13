@@ -28,7 +28,14 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	obj["stream"] = true
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
+	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
+	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
+	injectThinking(obj)
 	normalizeReasoningEffort(obj, efforts)
+	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
+	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
+	backfillReasoningContent(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
@@ -89,7 +96,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if best != "" {
 		if !strings.EqualFold(best, reqStr) {
 			obj[key] = best
-			log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
+			log.Printf("WARN: [upstream] reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
 		}
 		return
 	}
@@ -103,7 +110,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 	if lowest != "" {
 		obj[key] = lowest
-		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
+		log.Printf("WARN: [upstream] reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
 	}
 }
 
@@ -134,7 +141,7 @@ func normalizeRoles(obj map[string]any) {
 		}
 		if strings.EqualFold(strings.TrimSpace(role), "developer") {
 			msg["role"] = "system"
-			log.Printf("role normalized developer->system idx=%d", i)
+			log.Printf("[upstream] role normalized developer->system idx=%d", i)
 		}
 	}
 }

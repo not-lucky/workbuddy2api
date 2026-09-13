@@ -69,6 +69,9 @@ func main() {
 			GCInterval: cfg.SessionGCInterval,
 			Store:      store,
 			Available:  p.AvailableUIDs,
+			// 按模型的可用性口径：绑定号在当前模型被 6004 限额时重分配，
+			// 而不是被钉在这个号上反复失败。
+			AvailableForModel: p.AvailableUIDsForModel,
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -97,25 +100,54 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	// 出站 UA（A 段）：非空才做显式覆盖，空 = 默认 WorkBuddy 三段式
+	// `WorkBuddy/<client_version> WorkBuddy/<client_version> CLI/<cli_version>`。
+	up.UserAgent = cfg.Upstream.UserAgent
+	// 版本段（upstream.client_version / cli_version）：空 = 各走内置默认。
+	up.ClientVersion = cfg.Upstream.ClientVersion
+	up.CliVersion = cfg.Upstream.CliVersion
+	// 设备风控头（X-Device-Token）全局兜底 + 文件读取路径；空 = 不注入。
+	up.DeviceToken = cfg.Upstream.DeviceToken
+	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
+	// 用量归属头（X-Product/X-IDE-*）+ 客户端 IP 透传开关（见 ChatHeaders / handler）。
+	up.ClientName = cfg.Upstream.ClientName
+	up.PassthroughIP = cfg.Upstream.PassthroughIP
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:              p,
-		Upstream:          up,
-		CheckinHours:      cfg.Schedule.CheckinHours,
-		KeepaliveHours:    cfg.Schedule.KeepaliveHours,
-		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
-		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
+		Pool:                p,
+		Upstream:            up,
+		CheckinHours:        cfg.Schedule.CheckinHours,
+		TravelHours:         cfg.Schedule.TravelHours,
+		ActivityHours:       cfg.Schedule.ActivityHours,
+		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
+		ActivityReportCount: cfg.Schedule.ActivityReportCount,
+		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:      !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
-		log.Printf("签到已禁用（schedule.checkin_enabled=false）：猫猫旅行同时停摆（搭签到便车）")
-	case len(cfg.Schedule.CheckinHours) == 0:
-		log.Printf("猫猫旅行已合并到签到时点执行：签到 + 派猫 + 领取旅行奖励")
+		log.Printf("签到已禁用（schedule.checkin_enabled=false）")
 	default:
-		log.Printf("猫猫旅行已合并到签到时点执行：签到 + 派猫 + 领取旅行奖励（%v 点）", cfg.Schedule.CheckinHours)
+		log.Printf("签到已启用：%v 点（签到 + 余额查询解冻）", cfg.Schedule.CheckinHours)
+	}
+	switch {
+	case !cfg.Schedule.TravelEnabled:
+		log.Printf("猫猫旅行已禁用（schedule.travel_enabled=false）")
+	default:
+		log.Printf("猫猫旅行已启用：%v 点（独立排程：领养 / 派出 / 领奖）", cfg.Schedule.TravelHours)
+	}
+	switch {
+	case !cfg.Schedule.ActivityEnabled:
+		log.Printf("活跃上报已禁用（schedule.activity_enabled=false）")
+	default:
+		log.Printf("活跃上报已启用：%v 点（每号 %d 条，点亮连登 + 补满领猫对话门槛）", cfg.Schedule.ActivityHours, cfg.Schedule.ActivityReportCount)
 	}
 	if !cfg.Schedule.KeepaliveEnabled {
 		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
+	} else {
+		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
 	}
 
 	h := server.NewHandler(server.Config{
@@ -126,6 +158,9 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
+		PromptMode:   cfg.Prompt.Mode,
+		PromptText:   cfg.PromptText,
+		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

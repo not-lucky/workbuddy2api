@@ -37,8 +37,18 @@ func TestClassify(t *testing.T) {
 		{200, `{"code":1,"msg":"model usage limit exceeded"}`, ErrSoftRate},
 		{200, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
 		{500, `rate-limited upstream`, ErrSoftRate}, // 限流文案优先于 5xx 分类
-		// 反向锚定：不得回归。
-		{400, `Illegal API invocation from an unapproved channel`, ErrClient},
+		// 内容策略拦截（HTTP 400 + 审核文案）：误报信号，不罚账号，走降级重试。
+		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
+		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
+		{400, `unapproved channel`, ErrContentBlocked},
+		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
+		{400, `bad request`, ErrClient},
+		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
+		// 这是"发给上游的 body 有问题"（网关截断已由 413 消灭，剩余为客户端畸形 JSON），
+		// 换了账号也一样 400，不罚号。具体词优先于通用 4xx。
+		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
+		{400, `Unmarshal chat params failed`, ErrBadParams},
+		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
@@ -56,6 +66,64 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004）。
+func TestIsModelRateLimit(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		// 6004：模型级限流（issue #31 的核心场景）。
+		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, true},
+		{`{"code": 6004,"msg":"x"}`, true},
+		// 其他 code（非模型级限流）→ 不算。
+		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
+		{`{"code":1,"msg":"429 rate limit"}`, false},
+	}
+	for _, c := range cases {
+		if got := IsModelRateLimit(c.body); got != c.want {
+			t.Errorf("IsModelRateLimit(%q)=%v want %v", c.body, got, c.want)
+		}
+	}
+}
+
+// TestParseSoftRateReset 解析上游 429 6004 msg 里的「将在 … 重置」时间（## UTC+8）。
+func TestParseSoftRateReset(t *testing.T) {
+	future := time.Now().Add(35 * time.Minute)
+	ts := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
+	cases := []struct {
+		name string
+		body string
+		ok   bool
+	}{
+		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
+		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
+		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
+		{"非 6004 但带时间（不是模型级）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false},
+		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
+		{"空 body", ``, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := ParseSoftRateReset(c.body)
+			if ok != c.ok {
+				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
+			}
+			if ok {
+				// 解析结果 = ts 在 UTC+8 解释下的墙钟（截断到分钟），应与 future 相差 ±2 分钟。
+				if d := got.Sub(future); d < -2*time.Minute || d > 2*time.Minute {
+					t.Errorf("parsed=%v want ~%v (diff %v)", got, future, d)
+				}
+				if got.Location() != time.UTC {
+					// 不同指针的 FixedZone 实例相等性按 offset 判，这里只断言 offset。
+					if _, off := got.Zone(); off != 8*60*60 {
+						t.Errorf("zone offset=%d want +08:00", off)
+					}
+				}
+			}
+		})
+	}
+}
+
 type rtFunc func(*http.Request) (*http.Response, error)
 
 func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -70,11 +138,9 @@ func jsonResp(status int, body string) *http.Response {
 
 func testClient(fn rtFunc) *Client {
 	return &Client{
-		HTTP:              &http.Client{Transport: fn},
-		ChatBaseCN:        "https://chat.example",
-		BillingBaseCN:     "https://billing.example",
-		ChatBaseGlobal:    "https://chat-global.example",
-		BillingBaseGlobal: "https://billing-global.example",
+		HTTP:          &http.Client{Transport: fn},
+		ChatBaseCN:    "https://chat.example",
+		BillingBaseCN: "https://billing.example",
 	}
 }
 
@@ -153,7 +219,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", EnterpriseID: "e1"}
-	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -200,7 +266,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	}
 
 	// glm-5.2 只支持 low/high，请求 max → 降级为 high
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -219,7 +285,7 @@ func TestChatStreamHardCreditError(t *testing.T) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	_, status, respBody, err := c.ChatStream(a, []byte(`{}`))
+	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "")
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
@@ -258,7 +324,7 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 	c.IdleTimeout = 5 * time.Second
 
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -328,6 +394,122 @@ func TestDailyCheckinAlready(t *testing.T) {
 		t.Errorf("err=%v", err)
 	}
 }
+
+// TestIsAlreadyCheckin "今天已签到"判定为幂等成功（中文/英文 markers 均命中）。
+func TestIsAlreadyCheckin(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":10001,"msg":"今天已签到"}`), nil
+	})
+	if !IsAlreadyCheckin(c.DailyCheckin(&auth.Auth{AccessToken: "at"})) {
+		t.Error("今天已签到 应判为 already")
+	}
+
+	c2 := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":10001,"msg":"Already checked in today"}`), nil
+	})
+	if !IsAlreadyCheckin(c2.DailyCheckin(&auth.Auth{AccessToken: "at"})) {
+		t.Error("already(英文) 应判为 already")
+	}
+}
+
+// TestIsAlreadyCheckinRejectsNonUpstream 网络层/解析层错误不得当作幂等成功。
+// 误判会让当天实际未签到的账号被标成正常（停机补签遇到抖动时尤其危险）。
+func TestIsAlreadyCheckinRejectsNonUpstream(t *testing.T) {
+	if IsAlreadyCheckin(errors.New("dial tcp: connection refused")) {
+		t.Error("网络错误不得判为 already")
+	}
+	if IsAlreadyCheckin(errors.New("parse failed: unexpected EOF")) {
+		t.Error("解析错误不得判为 already")
+	}
+	// 非"已签到"语义的上游业务错误（如余额不足）也不得判为 already。
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":10002,"msg":"积分不足，请充值"}`), nil
+	})
+	if IsAlreadyCheckin(c.DailyCheckin(&auth.Auth{AccessToken: "at"})) {
+		t.Error("余额不足不得判为 already")
+	}
+	// nil 不判为 already。
+	if IsAlreadyCheckin(nil) {
+		t.Error("nil 不得判为 already")
+	}
+}
+
+func TestBasesAlwaysCN(t *testing.T) {
+	c := testClient(nil)
+	cn := &auth.Auth{Domain: ""}
+	other := &auth.Auth{Domain: "example.com"}
+	if c.chatBase(cn) != "https://chat.example" || c.billingBase(cn) != "https://billing.example" {
+		t.Error("cn bases wrong")
+	}
+	// 恒 CN：domain 不同不改变上游 host。
+	if c.chatBase(other) != c.chatBase(cn) || c.billingBase(other) != c.billingBase(cn) {
+		t.Error("bases must be CN regardless of domain")
+	}
+}
+
+func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
+	c := New()
+	if c.ChatHTTP == nil {
+		t.Fatal("ChatHTTP should be initialized")
+	}
+	if c.ChatHTTP.Timeout != 0 {
+		t.Errorf("ChatHTTP.Timeout=%v want 0 (no total cap)", c.ChatHTTP.Timeout)
+	}
+	// 共享同一个 Transport 实例，连接池不重复。
+	if c.ChatHTTP.Transport != c.HTTP.Transport {
+		t.Errorf("ChatHTTP and HTTP must share the same *http.Transport")
+	}
+	htr, ok := c.ChatHTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
+	}
+	if htr.ResponseHeaderTimeout != 120*time.Second {
+		t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
+	}
+}
+
+func TestChatStreamRoutesToChatHTTP(t *testing.T) {
+	// 显式注入 ChatHTTP（可辨识标记），验证 ChatStream 走它而非 HTTP。
+	chatHit, httpHit := false, false
+	c := testClient(func(*http.Request) (*http.Response, error) {
+		httpHit = true
+		return jsonResp(200, `{}`), nil
+	})
+	c.ChatHTTP = &http.Client{Transport: rtFunc(func(*http.Request) (*http.Response, error) {
+		chatHit = true
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
+	})}
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "")
+	if err != nil || status != 200 {
+		t.Fatalf("chat: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	if !chatHit {
+		t.Error("ChatStream should use ChatHTTP")
+	}
+	if httpHit {
+		t.Error("ChatStream must not use HTTP")
+	}
+}
+
+func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
+	c := testClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+		}, nil
+	})
+	if c.chatHTTP() != c.HTTP {
+		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
+	}
+}
+
 
 func TestBasesDispatchByRegion(t *testing.T) {
 	c := testClient(nil)
